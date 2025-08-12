@@ -1,15 +1,6 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
-
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: { origin: "*" }
-});
-
-let messages = {}; // { roomId: [ { name, text, time, userId, isOwner, theme } ] }
-let users = {};    // { socketId: { name, userId, theme, isOwner, roomId } }
+let messages = {}; // room messages
+let users = {};    // connected users
+let timeouts = {}; // { userId: timestampWhenTimeoutEnds }
 
 io.on('connection', socket => {
   console.log('User connected:', socket.id);
@@ -26,12 +17,18 @@ io.on('connection', socket => {
       Object.values(users).filter(u => u.roomId === users[socket.id].roomId)
     );
 
-    // Send chat history for that room
     socket.emit('chatHistory', messages[users[socket.id].roomId]);
   });
 
   socket.on('chatMessage', msg => {
     const user = users[socket.id] || {};
+
+    // Prevent sending if timed out
+    if (timeouts[user.userId] && Date.now() < timeouts[user.userId]) {
+      socket.emit('timeoutWarning', { remaining: timeouts[user.userId] - Date.now() });
+      return;
+    }
+
     const messageData = {
       name: user.name || 'Unknown',
       text: msg,
@@ -47,8 +44,22 @@ io.on('connection', socket => {
     io.to(user.roomId).emit('chatMessage', messageData);
   });
 
+  // Owner sets timeout
+  socket.on('setTimeoutStatus', ({ targetUserId, durationMs }) => {
+    const sender = users[socket.id];
+    if (!sender?.isOwner) return; // Only owners can timeout
+
+    timeouts[targetUserId] = Date.now() + durationMs;
+
+    // Tell that user they're timed out
+    Object.entries(users).forEach(([id, u]) => {
+      if (u.userId === targetUserId) {
+        io.to(id).emit('timedOut', { until: timeouts[targetUserId] });
+      }
+    });
+  });
+
   socket.on('createGroup', ({ groupId, members }) => {
-    // Just join the socket to the group
     socket.leave(users[socket.id].roomId);
     socket.join(groupId);
     users[socket.id].roomId = groupId;
@@ -70,8 +81,4 @@ io.on('connection', socket => {
       );
     }
   });
-});
-
-server.listen(process.env.PORT || 3000, () => {
-  console.log('Server is running');
 });
